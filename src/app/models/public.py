@@ -1,5 +1,8 @@
 from sqlalchemy import Column, Integer, String, Boolean, JSON
 from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import (
+    Column, Integer, String, Float, Boolean, DateTime, func
+)
 
 Base = declarative_base()
 
@@ -20,7 +23,7 @@ class PublicHostel(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
     address = Column(String, nullable=True)
-    metadata = Column(JSON, nullable=True)
+    _metadata = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=func.now(), nullable=False)
 
 
@@ -30,4 +33,8 @@ class PublicUser(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, nullable=False, index=True)
     full_name = Column(String, nullable=True)
+    hashed_password = Column(String, nullable=False)
     roles = Column(JSON, default=list)
+    is_active = Column(Boolean, default=True)
+    hostel_id = Column(Integer, nullable=True)  # links hostel_admins/tenants to a hostel
+    created_at = Column(DateTime, default=func.now())

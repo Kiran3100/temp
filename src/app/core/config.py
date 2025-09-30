@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "Hostel SaaS"
     DEBUG: bool = False
     # DB
-    DATABASE_URL: str = "postgresql+psycopg://postgres:Kiran$123@localhost:5432/hostel_saas"
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:Kiran$123@localhost:5432/hostel_saas"
     # JWT
     JWT_SECRET: str
     JWT_ALGORITHM: str = "HS256"
