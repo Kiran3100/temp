@@ -1,5 +1,4 @@
-# src/app/schemas/room.py
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Optional
 
 class RoomCreate(BaseModel):
@@ -8,10 +7,9 @@ class RoomCreate(BaseModel):
     capacity: int = 4
 
 class RoomOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
     id: int
     floor_id: int
     number: str
     capacity: int
-
-    class Config:
-        orm_mode = True

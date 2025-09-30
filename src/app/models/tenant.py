@@ -45,5 +45,5 @@ class Invoice(TenantBase):
     currency = Column(String(10), default="INR")
     status = Column(String(20), default="pending")  # pending, paid, failed
     external_payment_id = Column(String, nullable=True)
-    metadata = Column(Text, nullable=True)
+    _metadata = Column(Text, nullable=True)
     created_at = Column(DateTime, default=func.now())

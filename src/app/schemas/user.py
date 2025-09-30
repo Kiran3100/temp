@@ -1,14 +1,11 @@
-# src/app/schemas/user.py
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, ConfigDict
 from typing import List, Optional
 from enum import Enum
-
 
 class Role(str, Enum):
     super_admin = "super_admin"
     hostel_admin = "hostel_admin"
     tenant = "tenant"
-
 
 class UserCreate(BaseModel):
     email: EmailStr
@@ -16,16 +13,13 @@ class UserCreate(BaseModel):
     full_name: Optional[str]
     roles: List[Role] = [Role.tenant]
 
-
 class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
     id: int
     email: EmailStr
     full_name: Optional[str]
     roles: List[Role]
-
-    class Config:
-        orm_mode = True
-
 
 class Token(BaseModel):
     access_token: str
