@@ -6,6 +6,7 @@ from app.models.tenant import Bed as BedModel
 from app.db.session import get_tenant_db
 from typing import List
 from app.dependencies.auth import get_current_tenant_user
+from app.utils.tenant_utils import filter_tenant_records
 
 router = APIRouter()
 
@@ -28,11 +29,14 @@ async def create_bed(payload: BedCreate, request: Request, db_dep=Depends(tenant
 
 
 @router.get("/", response_model=List[BedOut])
-async def list_beds(request: Request, db_dep=Depends(tenant_db_for_request)):
-    async with (await db_dep) as session:
+async def list_beds(ctx=Depends(get_current_tenant_user)):
+    tenant_schema = ctx["tenant_schema"]
+    user = ctx["user"]
+
+    async with get_tenant_db(tenant_schema) as session:
         q = await session.execute(select(BedModel).order_by(BedModel.id))
         rows = q.scalars().all()
-        return rows
+        return filter_tenant_records(user, rows, tenant_id_attr="tenant_id")
     
 @router.get("/", response_model=List[BedOut])
 async def list_beds(ctx=Depends(get_current_tenant_user)):

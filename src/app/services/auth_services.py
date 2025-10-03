@@ -12,26 +12,6 @@ from app.schemas.user import Role
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-def verify_password(plain, hashed):
-    return pwd_context.verify(plain, hashed)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-def create_access_token(subject: str, data: dict = {}, expires_delta: int | None = None):
-    to_encode = {"sub": subject, **data}
-    expire = datetime.utcnow() + timedelta(minutes=(expires_delta or settings.ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    encoded = jwt.encode(to_encode, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
-    return encoded
-
-def verify_token(token: str):
-    try:
-        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
-        return payload
-    except Exception as e:
-        raise
-
 # 2FA helpers
 def generate_2fa_secret() -> str:
     return pyotp.random_base32()
@@ -43,9 +23,26 @@ def get_2fa_code(secret: str) -> str:
 def verify_2fa_code(secret: str, code: str) -> bool:
     return pyotp.TOTP(secret).verify(code)
 
-async def create_user(db: AsyncSession, email: str, password: str, full_name: Optional[str] = None, roles: list[str] | None = None) -> User:
+async def create_user(
+    db: AsyncSession, 
+    username: str,
+    email: str, 
+    password: str, 
+    mobile_number: str,
+    full_name: Optional[str] = None, 
+    roles: list[str] | None = None,
+    hostel_id: Optional[int] = None
+) -> User:
     roles = roles or [Role.tenant.value]
-    user = User(email=email, full_name=full_name, hashed_password=get_password_hash(password), roles=roles)
+    user = User(
+        username=username,
+        email=email, 
+        full_name=full_name, 
+        mobile_number=mobile_number,
+        hashed_password=get_password_hash(password), 
+        roles=roles,
+        hostel_id=hostel_id
+    )
     db.add(user)
     await db.commit()
     await db.refresh(user)
@@ -61,27 +58,11 @@ async def authenticate_user(db: AsyncSession, email: str, password: str) -> Opti
         return None
     return user
 
-
 def create_token_for_user(user: User) -> str:
-    """
-    Include hostel_id claim for hostel_admin and tenant roles.
-    """
     payload = {
         "sub": str(user.id),
         "roles": user.roles,
     }
     if "hostel_admin" in user.roles or "tenant" in user.roles:
         payload["hostel_id"] = user.hostel_id
-    return create_access_token(subject=user.id, roles=user.roles, expires_delta=None, extra=payload)
-
-def create_token_for_user(user: User) -> str:
-    """
-    Include hostel_id claim for hostel_admin and tenant roles.
-    """
-    payload = {
-        "sub": str(user.id),
-        "roles": user.roles,
-    }
-    if "hostel_admin" in user.roles or "tenant" in user.roles:
-        payload["hostel_id"] = user.hostel_id
-    return create_access_token(subject=user.id, roles=user.roles, expires_delta=None, extra=payload)
+    return create_access_token(subject=user.id, roles=user.roles, extra=payload)

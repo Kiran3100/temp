@@ -8,6 +8,7 @@ from app.db.session import get_tenant_db
 from decimal import Decimal
 from typing import List
 from app.dependencies.auth import get_current_tenant_user
+from app.utils.tenant_utils import filter_tenant_records, tenant_scoped_filter_query
 
 router = APIRouter()
 
@@ -56,13 +57,10 @@ async def list_invoices(ctx=Depends(get_current_tenant_user)):
     user = ctx["user"]
 
     async with get_tenant_db(tenant_schema) as session:
-        q = await session.execute(select(Invoice).order_by(Invoice.id))
-        invoices = q.scalars().all()
-
-        if "tenant" in user["roles"]:
-            invoices = [inv for inv in invoices if inv.tenant_id == user["id"]]
-
-        return invoices
+        q = select(Invoice).order_by(Invoice.id)
+        q = tenant_scoped_filter_query(user, q, Invoice)
+        rows = (await session.execute(q)).scalars().all()
+        return rows
 
 @router.post("/webhook/{provider}")
 async def payment_webhook(provider: str, request: Request):

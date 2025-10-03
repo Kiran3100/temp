@@ -20,6 +20,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
     return {
         "id": int(payload["sub"]),
+        "username": payload.get("username"), 
         "roles": payload.get("roles", []),
         "hostel_id": payload.get("hostel_id"),
     }

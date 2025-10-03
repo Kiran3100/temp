@@ -1,11 +1,17 @@
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from app.services.auth_services import verify_token
+from app.core.security import decode_token  # Import from security module instead
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
-    payload = verify_token(token)
+    try:
+        payload = decode_token(token)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials"
+        )
     # payload should include user_id and roles
     return payload
 

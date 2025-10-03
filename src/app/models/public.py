@@ -13,12 +13,14 @@ class User(BasePublic):
     __table_args__ = {"schema": "public"}
     
     id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, nullable=False, index=True)
     email = Column(String, unique=True, nullable=False, index=True)
+    mobile_number = Column(String, nullable=False)
     full_name = Column(String, nullable=True)
     hashed_password = Column(String, nullable=False)
-    roles = Column(JSON, default=list)  # ["super_admin"], ["hostel_admin"], ["tenant"]
+    roles = Column(JSON, default=list)
     is_active = Column(Boolean, default=True)
-    hostel_id = Column(Integer, nullable=True)  # links hostel_admins/tenants to a hostel
+    hostel_id = Column(Integer, nullable=True)
     two_fa_enabled = Column(Boolean, default=False)
     two_fa_secret = Column(String, nullable=True)
     created_at = Column(DateTime, default=func.now(), nullable=False)
