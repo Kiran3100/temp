@@ -9,6 +9,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import select, or_
 from app.core.security import verify_password
 from app.db.session import get_db
+from app.schemas.auth import LoginRequest
 
 router = APIRouter()
 
@@ -34,26 +35,20 @@ def register(payload: UserCreate, db=Depends(get_db)):
     token = create_token_for_user(user)
     return {"access_token": token, "token_type": "bearer"}
 
-
-
 @router.post("/token", response_model=Token)
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db=Depends(get_db)):
-    """Authenticate user with username or email, return JWT."""
+def login(payload: LoginRequest, db=Depends(get_db)):
     user = (
         db.query(UserModel)
         .filter(
             or_(
-                UserModel.username == form_data.username,
-                UserModel.email == form_data.username,
+                UserModel.username == payload.username,
+                UserModel.email == payload.username,
             )
         )
         .first()
     )
-
-    if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
-        )
+    if not user or not verify_password(payload.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_token_for_user(user)
     return {"access_token": token, "token_type": "bearer"}

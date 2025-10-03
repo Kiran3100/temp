@@ -14,13 +14,11 @@ engine = create_engine(
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
-@contextmanager
-def get_db(tenant_schema: str | None = None) -> Session:
+
+def get_db(tenant_schema: str | None = None):
     db = SessionLocal()
     try:
         if tenant_schema:
-            if not tenant_schema.replace("_", "").isalnum():
-                raise ValueError("Invalid schema name")
             db.execute(text(f'SET search_path TO "{tenant_schema}", public'))
         else:
             db.execute(text("SET search_path TO public"))

@@ -131,124 +131,96 @@ class HostelRepository(BaseRepository):
 
 # src/app/db/session.py
 
-from sqlalchemy import create_engine, event
-from sqlalchemy.orm import sessionmaker
-from app.core.config import settings
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker, Session
 from contextlib import contextmanager
-from contextlib import asynccontextmanager
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
-from typing import AsyncGenerator, Optional
-from app.db.engine import async_engine
-from app.models.public import BasePublic  # for public metadata
+from app.core.config import settings
+from app.models.public import BasePublic
 from app.models.tenant import TenantBase
 
-engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(
+    settings.DATABASE_URL.replace("+asyncpg", ""),  # use psycopg2
+    pool_pre_ping=True,
+    pool_size=getattr(settings, "DB_POOL_SIZE", 10),
+    max_overflow=getattr(settings, "DB_MAX_OVERFLOW", 20),
+)
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-@contextmanager
+
+
 def get_db(tenant_schema: str | None = None):
     db = SessionLocal()
     try:
         if tenant_schema:
-            # Use parameterized query to prevent SQL injection
-            # Note: schema names can't be parameterized, so validate input
-            if not tenant_schema.replace('_', '').isalnum():
-                raise ValueError("Invalid schema name")
-            db.execute(text("SET search_path TO :schema, public").bindparams(schema=tenant_schema))
+            db.execute(text(f'SET search_path TO "{tenant_schema}", public'))
+        else:
+            db.execute(text("SET search_path TO public"))
         yield db
     finally:
         db.close()
 
-@asynccontextmanager
-async def get_tenant_db(tenant_schema: Optional[str]) -> AsyncGenerator[AsyncSession, None]:
-    if not tenant_schema:
-        raise RuntimeError("Tenant schema not provided")
-    
-    # Validate schema name
-    if not tenant_schema.replace('_', '').isalnum():
-        raise ValueError("Invalid schema name")
-    
-    async with AsyncSessionLocal() as session:
-        # PostgreSQL doesn't support bind parameters for SET search_path
-        # Validate the schema name exists before setting
-        result = await session.execute(
-            text("SELECT schema_name FROM information_schema.schemata WHERE schema_name = :schema"),
-            {"schema": tenant_schema}
-        )
-        if not result.scalar():
-            raise ValueError(f"Schema {tenant_schema} does not exist")
-        
-        await session.execute(text(f"SET search_path TO {tenant_schema}, public"))
-        yield session
+def provision_tenant_schema(tenant_schema: str):
+    with engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{tenant_schema}"'))
+        conn.execute(text(f"SET search_path TO {tenant_schema}, public"))
+        TenantBase.metadata.create_all(bind=conn)
 
-
-@asynccontextmanager
-async def get_public_db() -> AsyncGenerator[AsyncSession, None]:
-    """
-    Provide an AsyncSession that uses the public schema.
-    """
-    async with AsyncSessionLocal() as session:
-        # ensure search_path set to public
-        await session.execute(text("SET search_path TO public"))
-        yield session
-
-
-# Helper to provision tenant (create schema + create tenant tables)
-async def provision_tenant_schema(tenant_schema: str):
-    async with async_engine.begin() as conn:
-        # create schema if not exists
-        await conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{tenant_schema}"'))
-        # set search path and create tables for tenant metadata
-        await conn.execute(text(f"SET search_path TO {tenant_schema}, public"))
-        # use run_sync to call metadata.create_all on sync connection
-        def _create_all(sync_conn):
-            TenantBase.metadata.create_all(bind=sync_conn)
-
-        await conn.run_sync(_create_all)
 
 
 # src/app/dependencies/auth.py
 
-from fastapi import Depends, HTTPException, status, Request
+ffrom fastapi import Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError
-from typing import Callable
-from app.core.security import decode_token  # Fixed: import from security, not config
-from app.core.config import settings
-
+from app.core.security import decode_token  # import decode_token from security
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
 
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing token"
+        )
     try:
         payload = decode_token(token)
     except JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
     if "sub" not in payload or "roles" not in payload:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload"
+        )
     return {
         "id": int(payload["sub"]),
-        "username": payload.get("username"), 
+        "username": payload.get("username"),
         "roles": payload.get("roles", []),
         "hostel_id": payload.get("hostel_id"),
     }
 
 
 def require_roles(*allowed_roles: str):
-    async def checker(current_user=Depends(get_current_user)):
+    def checker(current_user=Depends(get_current_user)):
         if not any(r in current_user["roles"] for r in allowed_roles):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient role")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient role"
+            )
         return current_user
     return checker
 
 
-async def get_current_tenant_user(request: Request, current_user=Depends(get_current_user)):
+def get_current_tenant_user(request: Request, current_user=Depends(get_current_user)):
     hostel_id_header = request.headers.get("X-Hostel-ID")
     if not hostel_id_header:
-        raise HTTPException(status_code=400, detail="X-Hostel-ID header required")
+        raise HTTPException(
+            status_code=400,
+            detail="X-Hostel-ID header required"
+        )
     tenant_schema = f"hostel_{hostel_id_header}"
     roles = current_user["roles"]
 
@@ -257,15 +229,22 @@ async def get_current_tenant_user(request: Request, current_user=Depends(get_cur
 
     if "hostel_admin" in roles:
         if str(current_user.get("hostel_id")) != hostel_id_header:
-            raise HTTPException(status_code=403, detail="Cannot access another hostel's resources")
+            raise HTTPException(
+                status_code=403,
+                detail="Cannot access another hostel's resources"
+            )
         return {"user": current_user, "tenant_schema": tenant_schema}
 
     if "tenant" in roles:
         if str(current_user.get("hostel_id")) != hostel_id_header:
-            raise HTTPException(status_code=403, detail="Tenant cannot access another hostel")
+            raise HTTPException(
+                status_code=403,
+                detail="Tenant cannot access another hostel"
+            )
         return {"user": current_user, "tenant_schema": tenant_schema}
 
     raise HTTPException(status_code=403, detail="Unknown role")
+
 
 
 
@@ -357,6 +336,7 @@ class TenantResolverMiddleware(BaseHTTPMiddleware):
 # src/app/models/public.py
 
 # src/app/models/public.py
+# src/app/models/public.py
 from sqlalchemy import Column, Integer, String, Boolean, JSON, DateTime, func
 from sqlalchemy.ext.declarative import declarative_base
 
@@ -396,7 +376,6 @@ class PublicHostel(BasePublic):
     address = Column(String, nullable=True)
     metadata_ = Column("metadata", JSON, nullable=True)  # Use metadata_ to avoid Python keyword
     created_at = Column(DateTime, default=func.now(), nullable=False)
-
 
 # src/app/models/tenant.py 
 
@@ -533,98 +512,85 @@ class TenantProfile(TenantBase):
 from fastapi import APIRouter, Depends, HTTPException, status
 from app.schemas.user import UserCreate, Token
 from app.dependencies.auth import oauth2_scheme, require_roles  # Add require_roles import
-from app.db.session import get_public_db
+from app.db.session import get_db
 from app.services.auth_services import create_user, authenticate_user, create_token_for_user
 from app.schemas.user import Role
 from app.models.user import User as UserModel
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import select, or_
 from app.core.security import verify_password
+from app.db.session import get_db
 
 router = APIRouter()
 
 
 @router.post("/register", response_model=Token)
-async def register(payload: UserCreate, db=Depends(get_public_db)):
-    async with db as session:
-        # Check if username already exists
-        existing_username = await session.execute(
-            UserModel.__table__.select().where(UserModel.username == payload.username)
-        )
-        if existing_username.scalars().first():
-            raise HTTPException(status_code=400, detail="Username already exists")
-        
-        # Check if email already exists
-        existing_email = await session.execute(
-            UserModel.__table__.select().where(UserModel.email == payload.email)
-        )
-        if existing_email.scalars().first():
-            raise HTTPException(status_code=400, detail="Email already exists")
+def register(payload: UserCreate, db=Depends(get_db)):
+    # Check if username exists
+    if db.query(UserModel).filter(UserModel.username == payload.username).first():
+        raise HTTPException(status_code=400, detail="Username already exists")
+    if db.query(UserModel).filter(UserModel.email == payload.email).first():
+        raise HTTPException(status_code=400, detail="Email already exists")
 
-        user = await create_user(
-            session,
-            username=payload.username,
-            email=payload.email,
-            password=payload.password,
-            mobile_number=payload.mobile_number,
-            full_name=payload.full_name,
-            roles=[r.value for r in payload.roles],
-            hostel_id=payload.hostel_id,
-        )
-        
-        token = create_token_for_user(user_id=user.id, roles=user.roles)
-        return {"access_token": token, "token_type": "bearer"}
+    user = create_user(
+        db,
+        username=payload.username,
+        email=payload.email,
+        password=payload.password,
+        mobile_number=payload.mobile_number,
+        full_name=payload.full_name,
+        roles=[r.value for r in payload.roles],
+        hostel_id=payload.hostel_id,
+    )
+    token = create_token_for_user(user)
+    return {"access_token": token, "token_type": "bearer"}
 
 
-@router.post("/token", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db=Depends(get_public_db)):
-    async with db as session:
-        # Try both username and email for flexibility
-        from sqlalchemy import or_
-        q = await session.execute(
-            select(UserModel).where(
-                or_(
-                    UserModel.username == form_data.username,
-                    UserModel.email == form_data.username
-                )
+
+@router.post("/token", response_model=Token, summary="Login with username/email + password")
+def login(payload: LoginRequest, db=Depends(get_db)):
+    """Authenticate user with username or email, return JWT."""
+    user = (
+        db.query(UserModel)
+        .filter(
+            or_(
+                UserModel.username == payload.username,
+                UserModel.email == payload.username,
             )
         )
-        user = q.scalars().first()
-        
-        if not user or not verify_password(form_data.password, user.hashed_password):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, 
-                detail="Invalid credentials"
-            )
-        
-        token = create_token_for_user(user)
-        return {"access_token": token, "token_type": "bearer"}
+        .first()
+    )
+
+    if not user or not verify_password(payload.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = create_token_for_user(user)
+    return {"access_token": token, "token_type": "bearer"}
 
 @router.post("/refresh", response_model=Token)
-async def refresh(current_token: str = Depends(oauth2_scheme), db=Depends(get_public_db)):
+def refresh(current_token: str = Depends(oauth2_scheme), db=Depends(get_db)):
+    """Validate an existing token and issue a new one."""
     from app.core.security import decode_token
+
     try:
         payload = decode_token(current_token)
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    
+
     user_id = int(payload.get("sub"))
-    
-    # Fetch fresh user data from DB
-    async with db as session:
-        q = await session.execute(select(UserModel).where(UserModel.id == user_id))
-        user = q.scalars().first()
-        if not user or not user.is_active:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
-    
+
+    user = db.query(UserModel).filter(UserModel.id == user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+
     new_token = create_token_for_user(user)
     return {"access_token": new_token, "token_type": "bearer"}
 
 
 @router.get("/me")
-async def me(user=Depends(require_roles("tenant", "hostel_admin", "super_admin"))):
+def me(user=Depends(require_roles("tenant", "hostel_admin", "super_admin"))):
+    """Return the current user from the JWT claims."""
     return user
-
 # src/app/routers/beds.py
 
 # src/app/routers/beds.py
@@ -979,6 +945,14 @@ async def get_user(user_id: int, db=Depends(get_public_db)):
             raise HTTPException(status_code=404, detail="User not found")
         return user
 
+# src/app/schemas/auth.py
+
+from pydantic import BaseModel
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
 # src/app/schemas/bed.py
 
 from pydantic import BaseModel, ConfigDict
@@ -1101,7 +1075,23 @@ class Role(str, Enum):
     super_admin = "super_admin"
     hostel_admin = "hostel_admin"
     tenant = "tenant"
+
 class UserCreate(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "username": "john_doe",
+                "email": "user@example.com",
+                "password": "string",
+                "confirm_password": "string",
+                "mobile_number": "1234567890",
+                "full_name": "string",
+                "roles": ["tenant"],
+                "hostel_id": 0
+            }
+        }
+    )
+    
     username: str = Field(..., min_length=3, max_length=50)
     email: EmailStr
     password: str = Field(min_length=6)
@@ -1126,13 +1116,12 @@ class UserOut(BaseModel):
     email: EmailStr
     full_name: Optional[str]
     mobile_number: str
-    roles: List[str]  # Changed from List[Role] to List[str]
+    roles: List[str]
     hostel_id: Optional[int]
 
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
-
 # src/app/services/auth_service.py
 
 from datetime import datetime, timedelta
