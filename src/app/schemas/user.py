@@ -6,7 +6,23 @@ class Role(str, Enum):
     super_admin = "super_admin"
     hostel_admin = "hostel_admin"
     tenant = "tenant"
+
 class UserCreate(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "username": "john_doe",
+                "email": "user@example.com",
+                "password": "string",
+                "confirm_password": "string",
+                "mobile_number": "1234567890",
+                "full_name": "string",
+                "roles": ["tenant"],
+                "hostel_id": 0
+            }
+        }
+    )
+    
     username: str = Field(..., min_length=3, max_length=50)
     email: EmailStr
     password: str = Field(min_length=6)
@@ -31,7 +47,7 @@ class UserOut(BaseModel):
     email: EmailStr
     full_name: Optional[str]
     mobile_number: str
-    roles: List[str]  # Changed from List[Role] to List[str]
+    roles: List[str]
     hostel_id: Optional[int]
 
 class Token(BaseModel):
