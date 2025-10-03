@@ -4,7 +4,7 @@ import hmac, hashlib
 from sqlalchemy import select
 from app.schemas.payment import InvoiceCreate, InvoiceOut
 from app.models.tenant import Invoice as InvoiceModel
-from app.db.session import get_tenant_db
+from app.db.session import get_db
 from decimal import Decimal
 from typing import List
 from app.dependencies.auth import get_current_tenant_user
@@ -31,7 +31,7 @@ async def tenant_db_for_request(request: Request):
     tenant_schema = getattr(request.state, "tenant_schema", None)
     if not tenant_schema:
         raise HTTPException(status_code=400, detail="Tenant header (X-Hostel-ID) required")
-    return get_tenant_db(tenant_schema)
+    return get_db(tenant_schema)
 
 
     
@@ -39,7 +39,7 @@ async def tenant_db_for_request(request: Request):
 @router.post("/invoices", response_model=InvoiceOut)
 async def create_invoice(payload: InvoiceCreate, ctx=Depends(get_current_tenant_user)):
     tenant_schema = ctx["tenant_schema"]
-    async with get_tenant_db(tenant_schema) as session:
+    async with get_db(tenant_schema) as session:
         inv = InvoiceModel(
             tenant_id=payload.tenant_id,
             amount=payload.amount,
@@ -57,7 +57,7 @@ async def list_invoices(ctx=Depends(get_current_tenant_user)):
     tenant_schema = ctx["tenant_schema"]
     user = ctx["user"]
 
-    async with get_tenant_db(tenant_schema) as session:
+    async with get_db(tenant_schema) as session:
         q = select(InvoiceModel).order_by(InvoiceModel.id)  # Use InvoiceModel
         q = tenant_scoped_filter_query(user, q, InvoiceModel)
         rows = (await session.execute(q)).scalars().all()

@@ -23,47 +23,27 @@ def get_2fa_code(secret: str) -> str:
 def verify_2fa_code(secret: str, code: str) -> bool:
     return pyotp.TOTP(secret).verify(code)
 
-async def create_user(
-    db: AsyncSession, 
-    username: str,
-    email: str, 
-    password: str, 
-    mobile_number: str,
-    full_name: Optional[str] = None, 
-    roles: list[str] | None = None,
-    hostel_id: Optional[int] = None
-) -> User:
+def create_user(db, username, email, password, mobile_number, full_name=None, roles=None, hostel_id=None):
     roles = roles or [Role.tenant.value]
     user = User(
         username=username,
-        email=email, 
-        full_name=full_name, 
+        email=email,
+        full_name=full_name,
         mobile_number=mobile_number,
-        hashed_password=get_password_hash(password), 
+        hashed_password=get_password_hash(password),
         roles=roles,
-        hostel_id=hostel_id
+        hostel_id=hostel_id,
     )
     db.add(user)
-    await db.commit()
-    await db.refresh(user)
+    db.commit()
+    db.refresh(user)
     return user
 
 
-async def authenticate_user(db: AsyncSession, username_or_email: str, password: str) -> Optional[User]:
+def authenticate_user(db, username_or_email, password):
     from sqlalchemy import or_
-    
-    q = await db.execute(
-        select(User).where(
-            or_(
-                User.username == username_or_email,
-                User.email == username_or_email
-            )
-        )
-    )
-    user = q.scalars().first()
-    if not user:
-        return None
-    if not verify_password(password, user.hashed_password):
+    user = db.query(User).filter(or_(User.username == username_or_email, User.email == username_or_email)).first()
+    if not user or not verify_password(password, user.hashed_password):
         return None
     return user
 
