@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field, ConfigDict, EmailStr
+from pydantic import BaseModel, EmailStr, Field, ConfigDict, field_validator
 from typing import List, Optional
 from enum import Enum
 
@@ -6,7 +6,6 @@ class Role(str, Enum):
     super_admin = "super_admin"
     hostel_admin = "hostel_admin"
     tenant = "tenant"
-
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     email: EmailStr
@@ -17,25 +16,12 @@ class UserCreate(BaseModel):
     roles: List[Role] = [Role.tenant]
     hostel_id: Optional[int] = None
     
-    def model_post_init(self, __context):
-        """Validate that passwords match"""
-        if self.password != self.confirm_password:
-            raise ValueError("Passwords do not match")
-        
-    class Config:
-        schema_extra = {
-            "example": {
-                "username": "",
-                "email": "",
-                "password": "",
-                "confirm_password": "",
-                "mobile_number": "",
-                "full_name": "",
-                "roles": [],
-                "hostel_id": None
-            }
-        }
-
+    @field_validator('confirm_password')
+    @classmethod
+    def passwords_match(cls, v, info):
+        if 'password' in info.data and v != info.data['password']:
+            raise ValueError('Passwords do not match')
+        return v
 
 class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -45,7 +31,7 @@ class UserOut(BaseModel):
     email: EmailStr
     full_name: Optional[str]
     mobile_number: str
-    roles: List[Role]
+    roles: List[str]  # Changed from List[Role] to List[str]
     hostel_id: Optional[int]
 
 class Token(BaseModel):

@@ -49,8 +49,17 @@ async def create_user(
     return user
 
 
-async def authenticate_user(db: AsyncSession, email: str, password: str) -> Optional[User]:
-    q = await db.execute(select(User).where(User.email == email))
+async def authenticate_user(db: AsyncSession, username_or_email: str, password: str) -> Optional[User]:
+    from sqlalchemy import or_
+    
+    q = await db.execute(
+        select(User).where(
+            or_(
+                User.username == username_or_email,
+                User.email == username_or_email
+            )
+        )
+    )
     user = q.scalars().first()
     if not user:
         return None

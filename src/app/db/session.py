@@ -12,20 +12,41 @@ from app.models.tenant import TenantBase
 
 engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-
 @contextmanager
 def get_db(tenant_schema: str | None = None):
     db = SessionLocal()
     try:
         if tenant_schema:
-            # set search path so subsequent table queries resolve to tenant schema
-            db.execute(f"SET search_path TO {tenant_schema}, public;")
+            # Use parameterized query to prevent SQL injection
+            # Note: schema names can't be parameterized, so validate input
+            if not tenant_schema.replace('_', '').isalnum():
+                raise ValueError("Invalid schema name")
+            db.execute(text("SET search_path TO :schema, public").bindparams(schema=tenant_schema))
         yield db
     finally:
         db.close()
-        
 
-AsyncSessionLocal = sessionmaker(bind=async_engine, class_=AsyncSession, expire_on_commit=False)
+@asynccontextmanager
+async def get_tenant_db(tenant_schema: Optional[str]) -> AsyncGenerator[AsyncSession, None]:
+    if not tenant_schema:
+        raise RuntimeError("Tenant schema not provided")
+    
+    # Validate schema name
+    if not tenant_schema.replace('_', '').isalnum():
+        raise ValueError("Invalid schema name")
+    
+    async with AsyncSessionLocal() as session:
+        # PostgreSQL doesn't support bind parameters for SET search_path
+        # Validate the schema name exists before setting
+        result = await session.execute(
+            text("SELECT schema_name FROM information_schema.schemata WHERE schema_name = :schema"),
+            {"schema": tenant_schema}
+        )
+        if not result.scalar():
+            raise ValueError(f"Schema {tenant_schema} does not exist")
+        
+        await session.execute(text(f"SET search_path TO {tenant_schema}, public"))
+        yield session
 
 
 @asynccontextmanager
@@ -36,19 +57,6 @@ async def get_public_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         # ensure search_path set to public
         await session.execute(text("SET search_path TO public"))
-        yield session
-
-
-@asynccontextmanager
-async def get_tenant_db(tenant_schema: Optional[str]) -> AsyncGenerator[AsyncSession, None]:
-    """
-    Provide an AsyncSession scoped to tenant schema via setting search_path.
-    tenant_schema: e.g. "hostel_7"
-    """
-    if not tenant_schema:
-        raise RuntimeError("Tenant schema not provided")
-    async with AsyncSessionLocal() as session:
-        await session.execute(text(f"SET search_path TO {tenant_schema}, public"))
         yield session
 
 

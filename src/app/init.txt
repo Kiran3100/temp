@@ -1,0 +1,1342 @@
+# src/app/core/audit.py
+
+from fastapi import Request
+from starlette.middleware.base import BaseHTTPMiddleware
+import datetime
+import json
+
+class AuditMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        now = datetime.datetime.utcnow()
+        response = await call_next(request)
+        # store audit: you can push to DB or queue
+        audit = {
+            "path": request.url.path,
+            "method": request.method,
+            "user": getattr(request.state, "user", None),
+            "status_code": response.status_code,
+            "timestamp": now.isoformat(),
+        }
+        # For demo: print; in prod push to DB table audit_logs or to a structured log system
+        print("AUDIT", json.dumps(audit))
+        return response
+
+# src/app/core/config.py
+
+from pydantic_settings import BaseSettings
+from pydantic import Field
+
+class Settings(BaseSettings):
+    model_config = {"env_file": ".env", "extra": "ignore"}
+    
+    APP_NAME: str = "Hostel SaaS"
+    DEBUG: bool = False
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:Kiran$123@localhost:5432/hostel_saas"
+    JWT_SECRET: str
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
+    REDIS_URL: str = "redis://localhost:6379/0"
+    SENDGRID_API_KEY: str = ""
+    FCM_SERVER_KEY: str = ""
+    STRIPE_WEBHOOK_SECRET: str = ""
+    RAZORPAY_WEBHOOK_SECRET: str = ""
+    SLACK_WEBHOOK_URL: str = ""
+    SUPER_ADMIN_EMAIL: str = "superadmin@example.com"
+    SUPER_ADMIN_PASSWORD: str = "changeme"
+
+settings = Settings()
+
+
+# src/app/core/logging.py
+
+# src/app/core/security.py
+
+# src/app/core/security.py
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+from passlib.context import CryptContext
+from jose import jwt, JWTError
+from app.core.config import settings
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+ALGORITHM = settings.JWT_ALGORITHM if hasattr(settings, "JWT_ALGORITHM") else "HS256"
+SECRET_KEY = settings.JWT_SECRET
+ACCESS_TOKEN_EXPIRE_MINUTES = int(getattr(settings, "ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 24))
+
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def create_access_token(subject: str | int, roles: list[str], expires_delta: Optional[timedelta] = None, extra: dict | None = None) -> str:
+    to_encode: Dict[str, Any] = {}
+    now = datetime.utcnow()
+    to_encode.update({"sub": str(subject), "roles": roles, "iat": now})
+    if extra:
+        to_encode.update(extra)
+    expire = now + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_token(token: str) -> dict:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError as exc:
+        raise JWTError("Could not validate credentials") from exc
+
+
+
+# src/app/db/base.py
+
+# src/app/db/engine.py
+
+# src/app/db/engine.py
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
+from app.core.config import settings
+
+# Async engine used for both public and tenant work. We'll set search_path per-session.
+async_engine: AsyncEngine = create_async_engine(
+    settings.DATABASE_URL,  
+    echo=True,
+    pool_pre_ping=True,
+)
+
+
+
+# src/app/db/repositories.py
+
+class BaseRepository:
+    def __init__(self, db):
+        self.db = db
+
+class HostelRepository(BaseRepository):
+    def create(self, payload):
+        obj = Hostel(**payload)
+        self.db.add(obj)
+        self.db.commit()
+        self.db.refresh(obj)
+        return obj
+
+    def get(self, id):
+        return self.db.query(Hostel).filter(Hostel.id == id).first()
+
+    def list(self, limit=50, offset=0):
+        return self.db.query(Hostel).offset(offset).limit(limit).all()
+
+# src/app/db/session.py
+
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
+from app.core.config import settings
+from contextlib import contextmanager
+from contextlib import asynccontextmanager
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from typing import AsyncGenerator, Optional
+from app.db.engine import async_engine
+from app.models.public import BasePublic  # for public metadata
+from app.models.tenant import TenantBase
+
+engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+@contextmanager
+def get_db(tenant_schema: str | None = None):
+    db = SessionLocal()
+    try:
+        if tenant_schema:
+            # Use parameterized query to prevent SQL injection
+            # Note: schema names can't be parameterized, so validate input
+            if not tenant_schema.replace('_', '').isalnum():
+                raise ValueError("Invalid schema name")
+            db.execute(text("SET search_path TO :schema, public").bindparams(schema=tenant_schema))
+        yield db
+    finally:
+        db.close()
+
+@asynccontextmanager
+async def get_tenant_db(tenant_schema: Optional[str]) -> AsyncGenerator[AsyncSession, None]:
+    if not tenant_schema:
+        raise RuntimeError("Tenant schema not provided")
+    
+    # Validate schema name
+    if not tenant_schema.replace('_', '').isalnum():
+        raise ValueError("Invalid schema name")
+    
+    async with AsyncSessionLocal() as session:
+        # PostgreSQL doesn't support bind parameters for SET search_path
+        # Validate the schema name exists before setting
+        result = await session.execute(
+            text("SELECT schema_name FROM information_schema.schemata WHERE schema_name = :schema"),
+            {"schema": tenant_schema}
+        )
+        if not result.scalar():
+            raise ValueError(f"Schema {tenant_schema} does not exist")
+        
+        await session.execute(text(f"SET search_path TO {tenant_schema}, public"))
+        yield session
+
+
+@asynccontextmanager
+async def get_public_db() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Provide an AsyncSession that uses the public schema.
+    """
+    async with AsyncSessionLocal() as session:
+        # ensure search_path set to public
+        await session.execute(text("SET search_path TO public"))
+        yield session
+
+
+# Helper to provision tenant (create schema + create tenant tables)
+async def provision_tenant_schema(tenant_schema: str):
+    async with async_engine.begin() as conn:
+        # create schema if not exists
+        await conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{tenant_schema}"'))
+        # set search path and create tables for tenant metadata
+        await conn.execute(text(f"SET search_path TO {tenant_schema}, public"))
+        # use run_sync to call metadata.create_all on sync connection
+        def _create_all(sync_conn):
+            TenantBase.metadata.create_all(bind=sync_conn)
+
+        await conn.run_sync(_create_all)
+
+
+# src/app/dependencies/auth.py
+
+from fastapi import Depends, HTTPException, status, Request
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError
+from typing import Callable
+from app.core.security import decode_token  # Fixed: import from security, not config
+from app.core.config import settings
+
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
+    try:
+        payload = decode_token(token)
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    if "sub" not in payload or "roles" not in payload:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
+    return {
+        "id": int(payload["sub"]),
+        "username": payload.get("username"), 
+        "roles": payload.get("roles", []),
+        "hostel_id": payload.get("hostel_id"),
+    }
+
+
+def require_roles(*allowed_roles: str):
+    async def checker(current_user=Depends(get_current_user)):
+        if not any(r in current_user["roles"] for r in allowed_roles):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient role")
+        return current_user
+    return checker
+
+
+async def get_current_tenant_user(request: Request, current_user=Depends(get_current_user)):
+    hostel_id_header = request.headers.get("X-Hostel-ID")
+    if not hostel_id_header:
+        raise HTTPException(status_code=400, detail="X-Hostel-ID header required")
+    tenant_schema = f"hostel_{hostel_id_header}"
+    roles = current_user["roles"]
+
+    if "super_admin" in roles:
+        return {"user": current_user, "tenant_schema": tenant_schema}
+
+    if "hostel_admin" in roles:
+        if str(current_user.get("hostel_id")) != hostel_id_header:
+            raise HTTPException(status_code=403, detail="Cannot access another hostel's resources")
+        return {"user": current_user, "tenant_schema": tenant_schema}
+
+    if "tenant" in roles:
+        if str(current_user.get("hostel_id")) != hostel_id_header:
+            raise HTTPException(status_code=403, detail="Tenant cannot access another hostel")
+        return {"user": current_user, "tenant_schema": tenant_schema}
+
+    raise HTTPException(status_code=403, detail="Unknown role")
+
+
+
+# src/app/dependencies/rbac.py
+
+from fastapi import Depends, HTTPException, status
+from app.schemas.rbac import ROLE_PERMISSIONS, RoleEnum
+from app.dependencies.auth import get_current_user  # your JWT auth dependency
+
+
+def require_permission(permission: str):
+    def wrapper(current_user=Depends(get_current_user)):
+        # Assume current_user["roles"] is a list of RoleEnum
+        for role in current_user["roles"]:
+            if permission in ROLE_PERMISSIONS[role]:
+                return current_user
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Permission '{permission}' denied",
+        )
+    return wrapper
+
+# src/app/middlewares/rbac.py
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from app.core.security import decode_token  # Import from security module instead
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = decode_token(token)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials"
+        )
+    # payload should include user_id and roles
+    return payload
+
+def require_roles(*allowed_roles):
+    def role_checker(current_user=Depends(get_current_user)):
+        roles = current_user.get("roles", [])
+        if not any(r in roles for r in allowed_roles):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient role")
+        return current_user
+    return role_checker
+
+# src/app/middlewares/tenant_middleware.py
+
+# src/app/middlewares/tenant_middleware.py
+from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi import Request
+from typing import Optional
+
+
+class TenantResolverMiddleware(BaseHTTPMiddleware):
+    """
+    Resolve tenant from header X-Hostel-ID (preferred) or query param `hostel_id`.
+    Attaches `request.state.tenant_schema` = 'hostel_{id}' or None.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        hostel_id: Optional[str] = None
+        # header preferred
+        if "x-hostel-id" in request.headers:
+            hostel_id = request.headers.get("x-hostel-id")
+        else:
+            # fallback to query param
+            qs_val = request.query_params.get("hostel_id")
+            if qs_val:
+                hostel_id = qs_val
+
+        if hostel_id:
+            # Basic sanitation: only digits expected - adjust as needed
+            hostel_id = hostel_id.strip()
+            # safe schema name
+            request.state.tenant_schema = f"hostel_{hostel_id}"
+        else:
+            request.state.tenant_schema = None
+
+        response = await call_next(request)
+        return response
+
+
+
+
+# src/app/models/public.py
+
+# src/app/models/public.py
+from sqlalchemy import Column, Integer, String, Boolean, JSON, DateTime, func
+from sqlalchemy.ext.declarative import declarative_base
+
+BasePublic = declarative_base()
+
+
+class User(BasePublic):
+    """
+    Public schema user table - stores all users (super_admin, hostel_admin, tenant)
+    """
+    __tablename__ = "users"
+    __table_args__ = {"schema": "public"}
+    
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, nullable=False, index=True)
+    email = Column(String, unique=True, nullable=False, index=True)
+    mobile_number = Column(String, nullable=False)
+    full_name = Column(String, nullable=True)
+    hashed_password = Column(String, nullable=False)
+    roles = Column(JSON, default=list)
+    is_active = Column(Boolean, default=True)
+    hostel_id = Column(Integer, nullable=True)
+    two_fa_enabled = Column(Boolean, default=False)
+    two_fa_secret = Column(String, nullable=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+
+class PublicHostel(BasePublic):
+    """
+    Public schema hostel registry - one entry per hostel/tenant
+    """
+    __tablename__ = "hostels"
+    __table_args__ = {"schema": "public"}
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    address = Column(String, nullable=True)
+    metadata_ = Column("metadata", JSON, nullable=True)  # Use metadata_ to avoid Python keyword
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+
+# src/app/models/tenant.py 
+
+# src/app/models/tenant.py
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Numeric,
+    Text,
+    func,
+)
+from sqlalchemy.orm import declarative_base, relationship
+
+TenantBase = declarative_base()
+
+class Floor(TenantBase):
+    __tablename__ = "floors"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    created_at = Column(DateTime, default=func.now())
+
+class Room(TenantBase):
+    __tablename__ = "rooms"
+    id = Column(Integer, primary_key=True, index=True)
+    floor_id = Column(Integer, nullable=False)
+    number = Column(String, nullable=False, index=True)
+    capacity = Column(Integer, default=4)
+    created_at = Column(DateTime, default=func.now())
+
+class Bed(TenantBase):
+    __tablename__ = "beds"
+    id = Column(Integer, primary_key=True, index=True)
+    room_id = Column(Integer, nullable=False)
+    bed_no = Column(String, nullable=False)
+    occupied = Column(Boolean, default=False)
+    tenant_id = Column(Integer, nullable=True)  # reference to user id in public or tenant-profile
+    created_at = Column(DateTime, default=func.now())
+
+class Invoice(TenantBase):
+    __tablename__ = "invoices"
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, nullable=False)
+    amount = Column(Numeric(12, 2), nullable=False)
+    currency = Column(String(10), default="INR")
+    status = Column(String(20), default="pending")  # pending, paid, failed
+    external_payment_id = Column(String, nullable=True)
+    _metadata = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+
+
+# src/app/models/user.py
+
+from app.models.public import User, BasePublic
+
+__all__ = ["User", "BasePublic"]
+
+# src/app/models/rbac.py
+
+from sqlalchemy import Column, Integer, String, Enum, ForeignKey
+from sqlalchemy.orm import relationship
+import enum
+from app.db.base import Base
+
+
+class RoleEnumDB(str, enum.Enum):
+    super_admin = "super_admin"
+    admin = "admin"
+
+
+class Role(Base):
+    __tablename__ = "roles"
+    id = Column(Integer, primary_key=True)
+    name = Column(Enum(RoleEnumDB), unique=True, nullable=False)
+
+
+class UserRole(Base):
+    __tablename__ = "user_roles"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    role_id = Column(Integer, ForeignKey("roles.id"), nullable=False)
+
+    # relationships
+    roles = relationship("UserRole", back_populates="user")
+
+# src/app/models/tenant_base.py
+
+from sqlalchemy import Column, Integer, String, ForeignKey, Boolean, DateTime, Text
+from sqlalchemy.ext.declarative import declarative_base
+import datetime
+
+TenantBase = declarative_base()
+
+class Hostel(TenantBase):
+    __tablename__ = "hostels"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    address = Column(String)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class Floor(TenantBase):
+    __tablename__ = "floors"
+    id = Column(Integer, primary_key=True)
+    hostel_id = Column(Integer, nullable=False)  # redundant if per-schema, but helpful
+    name = Column(String)
+
+class Room(TenantBase):
+    __tablename__ = "rooms"
+    id = Column(Integer, primary_key=True)
+    floor_id = Column(Integer, nullable=False)
+    number = Column(String)
+
+class Bed(TenantBase):
+    __tablename__ = "beds"
+    id = Column(Integer, primary_key=True)
+    room_id = Column(Integer, nullable=False)
+    bed_no = Column(String)
+    occupied = Column(Boolean, default=False)
+
+class TenantProfile(TenantBase):
+    __tablename__ = "tenant_profiles"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False)
+    bed_id = Column(Integer, nullable=True)
+    is_active = Column(Boolean, default=True)
+    deleted = Column(Boolean, default=False)
+
+
+# src/app/routers/auth.py
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.schemas.user import UserCreate, Token
+from app.dependencies.auth import oauth2_scheme, require_roles  # Add require_roles import
+from app.db.session import get_public_db
+from app.services.auth_services import create_user, authenticate_user, create_token_for_user
+from app.schemas.user import Role
+from app.models.user import User as UserModel
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy import select, or_
+from app.core.security import verify_password
+
+router = APIRouter()
+
+
+@router.post("/register", response_model=Token)
+async def register(payload: UserCreate, db=Depends(get_public_db)):
+    async with db as session:
+        # Check if username already exists
+        existing_username = await session.execute(
+            UserModel.__table__.select().where(UserModel.username == payload.username)
+        )
+        if existing_username.scalars().first():
+            raise HTTPException(status_code=400, detail="Username already exists")
+        
+        # Check if email already exists
+        existing_email = await session.execute(
+            UserModel.__table__.select().where(UserModel.email == payload.email)
+        )
+        if existing_email.scalars().first():
+            raise HTTPException(status_code=400, detail="Email already exists")
+
+        user = await create_user(
+            session,
+            username=payload.username,
+            email=payload.email,
+            password=payload.password,
+            mobile_number=payload.mobile_number,
+            full_name=payload.full_name,
+            roles=[r.value for r in payload.roles],
+            hostel_id=payload.hostel_id,
+        )
+        
+        token = create_token_for_user(user_id=user.id, roles=user.roles)
+        return {"access_token": token, "token_type": "bearer"}
+
+
+@router.post("/token", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db=Depends(get_public_db)):
+    async with db as session:
+        # Try both username and email for flexibility
+        from sqlalchemy import or_
+        q = await session.execute(
+            select(UserModel).where(
+                or_(
+                    UserModel.username == form_data.username,
+                    UserModel.email == form_data.username
+                )
+            )
+        )
+        user = q.scalars().first()
+        
+        if not user or not verify_password(form_data.password, user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, 
+                detail="Invalid credentials"
+            )
+        
+        token = create_token_for_user(user)
+        return {"access_token": token, "token_type": "bearer"}
+
+@router.post("/refresh", response_model=Token)
+async def refresh(current_token: str = Depends(oauth2_scheme), db=Depends(get_public_db)):
+    from app.core.security import decode_token
+    try:
+        payload = decode_token(current_token)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    
+    user_id = int(payload.get("sub"))
+    
+    # Fetch fresh user data from DB
+    async with db as session:
+        q = await session.execute(select(UserModel).where(UserModel.id == user_id))
+        user = q.scalars().first()
+        if not user or not user.is_active:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+    
+    new_token = create_token_for_user(user)
+    return {"access_token": new_token, "token_type": "bearer"}
+
+
+@router.get("/me")
+async def me(user=Depends(require_roles("tenant", "hostel_admin", "super_admin"))):
+    return user
+
+# src/app/routers/beds.py
+
+# src/app/routers/beds.py
+from fastapi import APIRouter, Depends, Request, HTTPException
+from sqlalchemy import select, update
+from app.schemas.bed import BedCreate, BedOut, BedAssign
+from app.models.tenant import Bed as BedModel
+from app.db.session import get_tenant_db
+from typing import List
+from app.dependencies.auth import get_current_tenant_user
+from app.utils.tenant_utils import filter_tenant_records
+
+router = APIRouter()
+
+
+async def tenant_db_for_request(request: Request):
+    tenant_schema = getattr(request.state, "tenant_schema", None)
+    if not tenant_schema:
+        raise HTTPException(status_code=400, detail="Tenant header (X-Hostel-ID) required")
+    return get_tenant_db(tenant_schema)
+
+
+@router.post("/", response_model=BedOut)
+async def create_bed(payload: BedCreate, ctx=Depends(get_current_tenant_user)):
+    tenant_schema = ctx["tenant_schema"]
+    async with get_tenant_db(tenant_schema) as session:
+        bed = BedModel(room_id=payload.room_id, bed_no=payload.bed_no)
+        session.add(bed)
+        await session.commit()
+        await session.refresh(bed)
+        return bed
+    
+@router.get("/", response_model=List[BedOut])
+async def list_beds(ctx=Depends(get_current_tenant_user)):
+    tenant_schema = ctx["tenant_schema"]
+    user = ctx["user"]
+
+    async with get_tenant_db(tenant_schema) as session:
+        q = await session.execute(select(BedModel).order_by(BedModel.id))
+        beds = q.scalars().all()
+
+        # If tenant role: filter only their bed
+        if "tenant" in user["roles"]:
+            beds = [b for b in beds if b.tenant_id == user["id"]]
+
+        return beds
+
+
+@router.post("/{bed_id}/assign", response_model=BedOut)
+async def assign_bed(bed_id: int, payload: BedAssign, request: Request, db_dep=Depends(tenant_db_for_request)):
+    async with (await db_dep) as session:
+        q = await session.execute(select(BedModel).where(BedModel.id == bed_id))
+        bed = q.scalars().first()
+        if not bed:
+            raise HTTPException(status_code=404, detail="Bed not found")
+        if bed.occupied:
+            raise HTTPException(status_code=400, detail="Bed already occupied")
+        # assign
+        bed.tenant_id = payload.tenant_id
+        bed.occupied = True
+        session.add(bed)
+        await session.commit()
+        await session.refresh(bed)
+        return bed
+
+
+# src/app/routers/complaints.py
+
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime
+from app.dependencies.auth import get_current_tenant_user
+
+router = APIRouter()
+
+
+class ComplaintCreate(BaseModel):
+    title: str
+    description: str
+    category: Optional[str] = "general"
+
+
+class ComplaintOut(BaseModel):
+    id: int
+    title: str
+    description: str
+    category: str
+    status: str
+    tenant_id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+@router.post("/", response_model=dict)
+async def create_complaint(payload: ComplaintCreate, ctx=Depends(get_current_tenant_user)):
+    """
+    Create a new complaint (tenant-specific)
+    Note: This is a placeholder. You'll need to create a Complaint model in tenant.py
+    """
+    tenant_schema = ctx["tenant_schema"]
+    user = ctx["user"]
+    
+    # Placeholder response - implement actual DB logic when Complaint model is added
+    return {
+        "message": "Complaint creation endpoint - implement with Complaint model",
+        "tenant_schema": tenant_schema,
+        "user_id": user["id"]
+    }
+
+
+@router.get("/", response_model=List[dict])
+async def list_complaints(ctx=Depends(get_current_tenant_user)):
+    """
+    List complaints for the current tenant
+    Note: This is a placeholder. You'll need to create a Complaint model in tenant.py
+    """
+    tenant_schema = ctx["tenant_schema"]
+    user = ctx["user"]
+    
+    # Placeholder response - implement actual DB logic when Complaint model is added
+    return []
+
+
+@router.get("/{complaint_id}", response_model=dict)
+async def get_complaint(complaint_id: int, ctx=Depends(get_current_tenant_user)):
+    """
+    Get a specific complaint by ID
+    Note: This is a placeholder. You'll need to create a Complaint model in tenant.py
+    """
+    tenant_schema = ctx["tenant_schema"]
+    user = ctx["user"]
+    
+    # Placeholder response
+    return {
+        "message": "Complaint retrieval endpoint - implement with Complaint model",
+        "complaint_id": complaint_id,
+        "tenant_schema": tenant_schema
+    }
+
+# src/app/routers/hostels.py
+
+
+from fastapi import APIRouter, Depends, Request, HTTPException
+from pydantic import BaseModel
+from app.db.session import get_db
+from app.services.hostel_service import HostelService
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from app.schemas.hostel import HostelCreate, HostelOut
+from app.schemas.user import Role
+from app.db.session import get_public_db, provision_tenant_schema
+from app.models.public import PublicHostel
+from typing import List
+from decimal import Decimal
+from app.dependencies.auth import require_roles  # Use only this import
+
+router = APIRouter()
+
+class HostelCreateIn(BaseModel):
+    name: str
+    address: str | None = None
+
+# Remove duplicate route definitions - keep only the final one
+@router.post("/", response_model=HostelOut, dependencies=[Depends(require_roles(Role.super_admin.value))])
+async def create_hostel(payload: HostelCreate, db=Depends(get_public_db)):
+    """
+    Create a hostel entry in public schema and provision its tenant schema.
+    Only super_admin can create hostels.
+    """
+    async with db as session:
+        new = PublicHostel(name=payload.name, address=payload.address)
+        session.add(new)
+        try:
+            await session.commit()
+            await session.refresh(new)
+        except Exception:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail="Hostel creation failed")
+        tenant_schema = f"hostel_{new.id}"
+        await provision_tenant_schema(tenant_schema)
+        return new
+
+
+@router.get("/", response_model=List[HostelOut])
+async def list_hostels(db=Depends(get_public_db)):
+    async with db as session:
+        q = await session.execute(select(PublicHostel).order_by(PublicHostel.id))
+        rows = q.scalars().all()
+        return rows
+
+# src/app/routers/payments.py
+
+from fastapi import APIRouter, Request, Header, HTTPException, Depends
+from app.core.config import settings
+import hmac, hashlib
+from sqlalchemy import select
+from app.schemas.payment import InvoiceCreate, InvoiceOut
+from app.models.tenant import Invoice as InvoiceModel
+from app.db.session import get_tenant_db
+from decimal import Decimal
+from typing import List
+from app.dependencies.auth import get_current_tenant_user
+from app.utils.tenant_utils import filter_tenant_records, tenant_scoped_filter_query
+from app.models.tenant import Invoice as InvoiceModel  
+
+router = APIRouter()
+
+@router.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig = request.headers.get("Stripe-Signature")
+    # In real code use stripe library to construct event with webhook secret
+    # Placeholder: verify signature, process payment intent succeeded events.
+    return {"ok": True}
+
+@router.post("/webhook/razorpay")
+async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(None)):
+    payload = await request.body()
+    # verify with RAZORPAY_WEBHOOK_SECRET
+    return {"ok": True}
+
+async def tenant_db_for_request(request: Request):
+    tenant_schema = getattr(request.state, "tenant_schema", None)
+    if not tenant_schema:
+        raise HTTPException(status_code=400, detail="Tenant header (X-Hostel-ID) required")
+    return get_tenant_db(tenant_schema)
+
+
+    
+    
+@router.post("/invoices", response_model=InvoiceOut)
+async def create_invoice(payload: InvoiceCreate, ctx=Depends(get_current_tenant_user)):
+    tenant_schema = ctx["tenant_schema"]
+    async with get_tenant_db(tenant_schema) as session:
+        inv = InvoiceModel(
+            tenant_id=payload.tenant_id,
+            amount=payload.amount,
+            currency=payload.currency,
+            status="pending",
+        )
+        session.add(inv)
+        await session.commit()
+        await session.refresh(inv)
+        return inv
+
+    
+@router.get("/invoices", response_model=List[InvoiceOut])
+async def list_invoices(ctx=Depends(get_current_tenant_user)):
+    tenant_schema = ctx["tenant_schema"]
+    user = ctx["user"]
+
+    async with get_tenant_db(tenant_schema) as session:
+        q = select(InvoiceModel).order_by(InvoiceModel.id)  # Use InvoiceModel
+        q = tenant_scoped_filter_query(user, q, InvoiceModel)
+        rows = (await session.execute(q)).scalars().all()
+        return rows
+
+@router.post("/webhook/{provider}")
+async def payment_webhook(provider: str, request: Request):
+    """
+    Webhook stub for payment providers (stripe / razorpay etc.)
+    You must verify signature and update invoice status accordingly.
+    """
+    body = await request.body()
+    headers = dict(request.headers)
+    # Placeholder: parse and verify according to provider; update invoice in tenant DB as needed.
+    return {"ok": True, "provider": provider, "received": len(body)}
+
+
+# src/app/routers/rooms.py
+
+from fastapi import APIRouter, Depends, Request, HTTPException
+from sqlalchemy import select
+from app.schemas.room import RoomCreate, RoomOut
+from app.models.tenant import Room as RoomModel
+from app.db.session import get_tenant_db
+from typing import List
+from app.dependencies.auth import get_current_tenant_user
+
+router = APIRouter()
+
+
+async def tenant_db_for_request(request: Request):
+    tenant_schema = getattr(request.state, "tenant_schema", None)
+    if not tenant_schema:
+        raise HTTPException(status_code=400, detail="Tenant header (X-Hostel-ID) required")
+    return get_tenant_db(tenant_schema)
+
+
+@router.post("/", response_model=RoomOut)
+async def create_room(payload: RoomCreate, ctx=Depends(get_current_tenant_user)):
+    tenant_schema = ctx["tenant_schema"]
+    async with get_tenant_db(tenant_schema) as session:
+        room = RoomModel(floor_id=payload.floor_id, number=payload.number, capacity=payload.capacity)
+        session.add(room)
+        await session.commit()
+        await session.refresh(room)
+        return room
+
+
+@router.get("/", response_model=List[RoomOut])
+async def list_rooms(ctx=Depends(get_current_tenant_user)):
+    tenant_schema = ctx["tenant_schema"]
+    async with get_tenant_db(tenant_schema) as session:
+        q = await session.execute(select(RoomModel).order_by(RoomModel.id))
+        return q.scalars().all()
+
+# src/app/routers/users.py
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from app.models.user import User
+from app.db.session import get_public_db
+from app.dependencies.auth import get_current_user, require_roles
+from app.schemas.user import UserOut
+from typing import List
+
+router = APIRouter()
+
+
+@router.get("/me", response_model=UserOut)
+async def get_current_user_info(current_user=Depends(get_current_user), db=Depends(get_public_db)):
+    """Get current user's information"""
+    async with db as session:
+        q = await session.execute(select(User).where(User.id == current_user["id"]))
+        user = q.scalars().first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        return user
+
+
+@router.get("/", response_model=List[UserOut], dependencies=[Depends(require_roles("super_admin"))])
+async def list_users(db=Depends(get_public_db)):
+    """List all users (super_admin only)"""
+    async with db as session:
+        q = await session.execute(select(User).order_by(User.id))
+        users = q.scalars().all()
+        return users
+
+
+@router.get("/{user_id}", response_model=UserOut, dependencies=[Depends(require_roles("super_admin", "hostel_admin"))])
+async def get_user(user_id: int, db=Depends(get_public_db)):
+    """Get a specific user by ID"""
+    async with db as session:
+        q = await session.execute(select(User).where(User.id == user_id))
+        user = q.scalars().first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        return user
+
+# src/app/schemas/bed.py
+
+from pydantic import BaseModel, ConfigDict
+from typing import Optional
+
+class BedCreate(BaseModel):
+    room_id: int
+    bed_no: str
+
+class BedAssign(BaseModel):
+    tenant_id: int
+
+class BedOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
+    id: int
+    room_id: int
+    bed_no: str
+    occupied: bool
+    tenant_id: Optional[int]
+
+# src/app/schemas/hostel.py
+
+from pydantic import BaseModel, Field, ConfigDict
+from typing import Optional
+
+class HostelCreate(BaseModel):
+    name: str = Field(..., example="Greenfield Hostel")
+    address: Optional[str] = Field(None, example="123, Campus Road")
+
+class HostelOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
+    id: int
+    name: str
+    address: Optional[str]
+
+# src/app/schemas/payment.py
+
+from pydantic import BaseModel, ConfigDict
+from decimal import Decimal
+
+class InvoiceCreate(BaseModel):
+    tenant_id: int
+    amount: Decimal
+    currency: str = "INR"
+
+class InvoiceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
+    id: int
+    tenant_id: int
+    amount: Decimal
+    currency: str
+    status: str
+
+# src/app/schemas/rbac.py
+from enum import Enum
+from pydantic import BaseModel
+from typing import List
+
+
+class RoleEnum(str, Enum):
+    super_admin = "super_admin"
+    admin = "admin"
+
+
+# Each role maps to allowed permissions
+ROLE_PERMISSIONS = {
+    RoleEnum.super_admin: {
+        "add_admin",
+        "add_tenant",
+        "add_hostel",
+        "add_floor",
+        "add_room",
+        "add_bed",
+    },
+    RoleEnum.admin: {
+        "add_tenant",
+        "add_hostel",
+        "add_floor",
+        "add_room",
+        "add_bed",
+    },
+}
+
+
+class UserRole(BaseModel):
+    role: RoleEnum
+    permissions: List[str]
+
+    class Config:
+        orm_mode = True
+
+# src/app/schemas/room.py
+
+from pydantic import BaseModel, ConfigDict
+from typing import Optional
+
+class RoomCreate(BaseModel):
+    floor_id: int
+    number: str
+    capacity: int = 4
+
+class RoomOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
+    id: int
+    floor_id: int
+    number: str
+    capacity: int
+
+
+# src/app/schemas/user.py
+from pydantic import BaseModel, EmailStr, Field, ConfigDict, field_validator
+from typing import List, Optional
+from enum import Enum
+
+class Role(str, Enum):
+    super_admin = "super_admin"
+    hostel_admin = "hostel_admin"
+    tenant = "tenant"
+class UserCreate(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    email: EmailStr
+    password: str = Field(min_length=6)
+    confirm_password: str = Field(min_length=6)
+    mobile_number: str = Field(..., min_length=10, max_length=15)
+    full_name: Optional[str] = None
+    roles: List[Role] = [Role.tenant]
+    hostel_id: Optional[int] = None
+    
+    @field_validator('confirm_password')
+    @classmethod
+    def passwords_match(cls, v, info):
+        if 'password' in info.data and v != info.data['password']:
+            raise ValueError('Passwords do not match')
+        return v
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
+    id: int
+    username: str
+    email: EmailStr
+    full_name: Optional[str]
+    mobile_number: str
+    roles: List[str]  # Changed from List[Role] to List[str]
+    hostel_id: Optional[int]
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+# src/app/services/auth_service.py
+
+from datetime import datetime, timedelta
+from jose import jwt
+from passlib.context import CryptContext
+import pyotp
+from app.core.config import settings
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.models.user import User
+from app.core.security import get_password_hash, verify_password, create_access_token
+from typing import Optional
+from app.schemas.user import Role
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# 2FA helpers
+def generate_2fa_secret() -> str:
+    return pyotp.random_base32()
+
+def get_2fa_code(secret: str) -> str:
+    totp = pyotp.TOTP(secret)
+    return totp.now()
+
+def verify_2fa_code(secret: str, code: str) -> bool:
+    return pyotp.TOTP(secret).verify(code)
+
+async def create_user(
+    db: AsyncSession, 
+    username: str,
+    email: str, 
+    password: str, 
+    mobile_number: str,
+    full_name: Optional[str] = None, 
+    roles: list[str] | None = None,
+    hostel_id: Optional[int] = None
+) -> User:
+    roles = roles or [Role.tenant.value]
+    user = User(
+        username=username,
+        email=email, 
+        full_name=full_name, 
+        mobile_number=mobile_number,
+        hashed_password=get_password_hash(password), 
+        roles=roles,
+        hostel_id=hostel_id
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+async def authenticate_user(db: AsyncSession, username_or_email: str, password: str) -> Optional[User]:
+    from sqlalchemy import or_
+    
+    q = await db.execute(
+        select(User).where(
+            or_(
+                User.username == username_or_email,
+                User.email == username_or_email
+            )
+        )
+    )
+    user = q.scalars().first()
+    if not user:
+        return None
+    if not verify_password(password, user.hashed_password):
+        return None
+    return user
+
+def create_token_for_user(user: User):
+    payload = {
+        "sub": str(user.id),
+        "username": user.username,
+        "email": user.email,
+        "roles": user.roles,
+    }
+    if user.hostel_id:
+        payload["hostel_id"] = user.hostel_id
+    return create_access_token(subject=user.id, roles=user.roles, extra=payload)
+
+# src/app/services/hostel_service.py
+
+from app.db.repositories import HostelRepository
+
+class HostelService:
+    def __init__(self, db):
+        self.repo = HostelRepository(db)
+
+    def create_hostel(self, data):
+        return self.repo.create(data)
+
+    def get_hostel(self, id):
+        return self.repo.get(id)
+
+
+# src/app/services/notification_service.py
+
+class NotificationService:
+    def __init__(self, sendgrid_key=None, fcm_key=None):
+        self.sendgrid_key = sendgrid_key
+        self.fcm_key = fcm_key
+
+    def send_email(self, to_email, subject, html):
+        # use sendgrid API client
+        pass
+
+    def send_push(self, device_token, data):
+        # use HTTP request to fcm endpoint with server key
+        pass
+
+    def send_slack_alert(self, text):
+        # post to slack webhook url
+        pass
+
+
+# src/app/services/payment_service.py
+
+
+
+# src/app/utils/tenant_utils.py
+
+from fastapi import HTTPException, status
+from typing import Sequence, Callable, Any
+
+def assert_tenant_access(user: dict, resource_hostel_id: int):
+    """
+    Enforce that the current_user can access a resource belonging to a hostel.
+    - super_admin: always allowed
+    - hostel_admin/tenant: only if user.hostel_id == resource_hostel_id
+    """
+    roles = user.get("roles", [])
+    if "super_admin" in roles:
+        return
+    if str(user.get("hostel_id")) != str(resource_hostel_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User cannot access resources of another hostel",
+        )
+
+def filter_tenant_records(user: dict, records: Sequence[Any], tenant_id_attr: str = "tenant_id"):
+    """
+    Restrict a collection of records based on tenant ownership.
+    - super_admin / hostel_admin: return all records
+    - tenant: return only records where record.tenant_id == user.id
+    """
+    roles = user.get("roles", [])
+    if "tenant" in roles:
+        return [rec for rec in records if getattr(rec, tenant_id_attr, None) == user["id"]]
+    return records
+
+def tenant_scoped_filter_query(user: dict, base_query, model, tenant_id_field: str = "tenant_id"):
+    """
+    For ORM queries: restrict tenant access at query level.
+    Example:
+        q = select(Invoice)
+        q = tenant_scoped_filter_query(user, q, Invoice)
+        rows = (await session.execute(q)).scalars().all()
+    """
+    from sqlalchemy import and_
+
+    roles = user.get("roles", [])
+    if "tenant" in roles:
+        q = base_query.where(getattr(model, tenant_id_field) == user["id"])
+        return q
+    return base_query
+
+
+# src/.env
+
+
+# JWT Settings
+JWT_SECRET=xK9vN2pL5mQ8wR3tY6uZ1aB4cD7eF0gH9iJ2kL5mN8oP
+JWT_ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+
+# Database
+DATABASE_URL=postgresql+asyncpg://postgres:Kiran$123@localhost:5432/hostel_saas
+DEBUG=False
+
+# Optional: Override pool settings
+DB_POOL_SIZE=20
+DB_MAX_OVERFLOW=10
+
+
+# src/requirements.txt
+
+fastapi==0.104.1
+uvicorn==0.24.0
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+pydantic==2.5.0
+python-dotenv==1.0.0
+passlib==1.7.4
+python-jose==3.3.0
+alembic==1.13.1
+pytest==7.4.3
+pytest-asyncio==0.21.1
+httpx==0.25.2
+pydantic-core==2.14.1
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+python-multipart==0.0.6
+bcrypt==4.0.1
+psycopg[binary]==3.1.18
+asyncpg==0.29.0

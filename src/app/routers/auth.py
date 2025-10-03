@@ -6,6 +6,8 @@ from app.services.auth_services import create_user, authenticate_user, create_to
 from app.schemas.user import Role
 from app.models.user import User as UserModel
 from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy import select, or_
+from app.core.security import verify_password
 
 router = APIRouter()
 
@@ -45,27 +47,47 @@ async def register(payload: UserCreate, db=Depends(get_public_db)):
 @router.post("/token", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends(), db=Depends(get_public_db)):
     async with db as session:
-        user = await authenticate_user(session, form_data.username, form_data.password)
-        if not user:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-        # token now carries hostel_id claim automatically
+        # Try both username and email for flexibility
+        from sqlalchemy import or_
+        q = await session.execute(
+            select(UserModel).where(
+                or_(
+                    UserModel.username == form_data.username,
+                    UserModel.email == form_data.username
+                )
+            )
+        )
+        user = q.scalars().first()
+        
+        if not user or not verify_password(form_data.password, user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, 
+                detail="Invalid credentials"
+            )
+        
         token = create_token_for_user(user)
         return {"access_token": token, "token_type": "bearer"}
 
 @router.post("/refresh", response_model=Token)
-async def refresh(current_token: str = Depends(oauth2_scheme)):
-    """
-    Refresh the token: validate existing token and emit a new one with new exp.
-    """
+async def refresh(current_token: str = Depends(oauth2_scheme), db=Depends(get_public_db)):
     from app.core.security import decode_token
     try:
         payload = decode_token(current_token)
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    user_id = payload.get("sub")
-    roles = payload.get("roles", [])
-    new_token = create_token_for_user(user_id=user_id, roles=roles)
+    
+    user_id = int(payload.get("sub"))
+    
+    # Fetch fresh user data from DB
+    async with db as session:
+        q = await session.execute(select(UserModel).where(UserModel.id == user_id))
+        user = q.scalars().first()
+        if not user or not user.is_active:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+    
+    new_token = create_token_for_user(user)
     return {"access_token": new_token, "token_type": "bearer"}
+
 
 @router.get("/me")
 async def me(user=Depends(require_roles("tenant", "hostel_admin", "super_admin"))):

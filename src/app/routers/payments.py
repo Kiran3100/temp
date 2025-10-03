@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import List
 from app.dependencies.auth import get_current_tenant_user
 from app.utils.tenant_utils import filter_tenant_records, tenant_scoped_filter_query
+from app.models.tenant import Invoice as InvoiceModel  
 
 router = APIRouter()
 
@@ -57,8 +58,8 @@ async def list_invoices(ctx=Depends(get_current_tenant_user)):
     user = ctx["user"]
 
     async with get_tenant_db(tenant_schema) as session:
-        q = select(Invoice).order_by(Invoice.id)
-        q = tenant_scoped_filter_query(user, q, Invoice)
+        q = select(InvoiceModel).order_by(InvoiceModel.id)  # Use InvoiceModel
+        q = tenant_scoped_filter_query(user, q, InvoiceModel)
         rows = (await session.execute(q)).scalars().all()
         return rows
 

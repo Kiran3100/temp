@@ -19,24 +19,14 @@ async def tenant_db_for_request(request: Request):
 
 
 @router.post("/", response_model=BedOut)
-async def create_bed(payload: BedCreate, request: Request, db_dep=Depends(tenant_db_for_request)):
-    async with (await db_dep) as session:
+async def create_bed(payload: BedCreate, ctx=Depends(get_current_tenant_user)):
+    tenant_schema = ctx["tenant_schema"]
+    async with get_tenant_db(tenant_schema) as session:
         bed = BedModel(room_id=payload.room_id, bed_no=payload.bed_no)
         session.add(bed)
         await session.commit()
         await session.refresh(bed)
         return bed
-
-
-@router.get("/", response_model=List[BedOut])
-async def list_beds(ctx=Depends(get_current_tenant_user)):
-    tenant_schema = ctx["tenant_schema"]
-    user = ctx["user"]
-
-    async with get_tenant_db(tenant_schema) as session:
-        q = await session.execute(select(BedModel).order_by(BedModel.id))
-        rows = q.scalars().all()
-        return filter_tenant_records(user, rows, tenant_id_attr="tenant_id")
     
 @router.get("/", response_model=List[BedOut])
 async def list_beds(ctx=Depends(get_current_tenant_user)):
