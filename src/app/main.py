@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from app.core.config import settings
 from app.middlewares.tenant_middleware import TenantResolverMiddleware
-from app.routers import auth, users, hostels, rooms, payments, complaints, beds
+from app.routers import auth, tenants_register, users, hostels, rooms, payments, beds, admin_dashboard, admin_complaints, notices, fee_collection, occupancy, tenants_dashboard, tenants_profile, tenants_payments, tenants_notices, helpdesk_users, escalations, tenants_register
 import uvicorn
 from app.db.engine import async_engine
 from app.models.public import BasePublic
@@ -20,8 +20,27 @@ def create_app() -> FastAPI:
     app.include_router(hostels.router, prefix="/hostels", tags=["hostels"])
     app.include_router(rooms.router, prefix="/rooms", tags=["rooms"])
     app.include_router(payments.router, prefix="/payments", tags=["payments"])
-    app.include_router(complaints.router, prefix="/complaints", tags=["complaints"])
+    # app.include_router(complaints.router, prefix="/complaints", tags=["complaints"])
     app.include_router(beds.router, prefix="/beds", tags=["beds"])
+    
+    # admin dashboard
+    app.include_router(admin_dashboard.router)
+    app.include_router(admin_complaints.router)
+    app.include_router(notices.router)
+    app.include_router(fee_collection.router)
+    app.include_router(occupancy.router)
+    
+    # tenant routes
+    app.include_router(tenants_dashboard.router)
+    app.include_router(tenants_profile.router)
+    app.include_router(tenants_payments.router)
+    app.include_router(tenants_notices.router)
+    app.include_router(tenants_register.router, prefix="/register", tags=["Tenants Register"])
+    
+    
+    # helpdesk routers
+    app.include_router(helpdesk_users.router)
+    app.include_router(escalations.router)
 
     @app.on_event("startup")
     async def startup():
