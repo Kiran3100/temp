@@ -58,11 +58,13 @@ async def authenticate_user(db: AsyncSession, email: str, password: str) -> Opti
         return None
     return user
 
-def create_token_for_user(user: User) -> str:
+def create_token_for_user(user: User):
     payload = {
         "sub": str(user.id),
+        "username": user.username,
+        "email": user.email,
         "roles": user.roles,
     }
-    if "hostel_admin" in user.roles or "tenant" in user.roles:
+    if user.hostel_id:
         payload["hostel_id"] = user.hostel_id
     return create_access_token(subject=user.id, roles=user.roles, extra=payload)

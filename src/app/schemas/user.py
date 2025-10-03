@@ -21,6 +21,20 @@ class UserCreate(BaseModel):
         """Validate that passwords match"""
         if self.password != self.confirm_password:
             raise ValueError("Passwords do not match")
+        
+    class Config:
+        schema_extra = {
+            "example": {
+                "username": "",
+                "email": "",
+                "password": "",
+                "confirm_password": "",
+                "mobile_number": "",
+                "full_name": "",
+                "roles": [],
+                "hostel_id": None
+            }
+        }
 
 
 class UserOut(BaseModel):
